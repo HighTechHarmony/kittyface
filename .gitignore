@@ -1,0 +1,13 @@
+# ESP-IDF build output and generated config
+build/
+sdkconfig
+sdkconfig.old
+
+# IDF component manager downloads
+managed_components/
+
+# Editor / OS
+.vscode/
+.cache/
+.DS_Store
+*.swp

@@ -1,0 +1,19 @@
+menu "Kittyface Audio"
+
+    config KF_I2S_BCLK_GPIO
+        int "I2S BCLK GPIO"
+        default 21
+
+    config KF_I2S_WS_GPIO
+        int "I2S WS/LRCK GPIO"
+        default 22
+
+    config KF_I2S_DOUT_GPIO
+        int "I2S data out GPIO (amp DIN)"
+        default 23
+
+    config KF_SAMPLE_RATE
+        int "Sample rate (Hz)"
+        default 16000
+
+endmenu
