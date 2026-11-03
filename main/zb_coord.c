@@ -10,6 +10,7 @@
 #include "nvs_flash.h"
 #include "status_led.h"
 #include "wav_player.h"
+#include "nwk/esp_zigbee_nwk.h"
 #include "zboss_api.h"
 
 #define COORD_ENDPOINT 1
@@ -18,6 +19,7 @@
 #define MAX_CHILDREN 10
 #define NVS_NS "kf"
 #define NVS_KEY_BUTTON "button_ieee"
+#define NVS_KEY_SHORT "button_short"
 #define OUTSIDE_WAV "desi_outside.wav"
 #define PAIRING_MODE_WAV "pairing_mode.wav"
 #define PAIRING_OK_WAV "pairing_successful.wav"
@@ -29,6 +31,7 @@ static esp_zb_ieee_addr_t s_button_ieee;
 static volatile bool s_have_button;
 static volatile bool s_pairing;
 static volatile bool s_stack_ready;
+static uint16_t s_button_short = 0xFFFF;
 
 static void ieee_to_str(const uint8_t *a, char *out)
 {
@@ -41,6 +44,9 @@ static void load_button(void)
     size_t len = sizeof(s_button_ieee);
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         s_have_button = nvs_get_blob(h, NVS_KEY_BUTTON, s_button_ieee, &len) == ESP_OK && len == sizeof(s_button_ieee);
+        if (s_have_button) {
+            nvs_get_u16(h, NVS_KEY_SHORT, &s_button_short);
+        }
         nvs_close(h);
     }
     if (s_have_button) {
@@ -62,11 +68,24 @@ static void save_button(const esp_zb_ieee_addr_t ieee)
     s_have_button = true;
 }
 
+static void save_button_short(uint16_t short_addr)
+{
+    s_button_short = short_addr;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, NVS_KEY_SHORT, short_addr);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 static void erase_button(void)
 {
+    s_button_short = 0xFFFF;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_erase_key(h, NVS_KEY_BUTTON);
+        nvs_erase_key(h, NVS_KEY_SHORT);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -141,8 +160,17 @@ static bool raw_command_cb(uint8_t bufid)
     }
     uint16_t src = hdr->addr_data.common_data.source.u.short_addr;
     ESP_LOGI(TAG, "on/off cmd 0x%02x from 0x%04x", hdr->cmd_id, src);
-    if (!s_have_button || esp_zb_address_short_by_ieee(s_button_ieee) != src) {
+    if (!s_have_button) {
         return false;
+    }
+    // The stack's IEEE->short map is not guaranteed to survive a reboot, so fall back to the saved short address.
+    uint16_t known = esp_zb_address_short_by_ieee(s_button_ieee);
+    ESP_LOGI(TAG, "button short: stack 0x%04x saved 0x%04x", known, s_button_short);
+    if (known != src && !(known == 0xFFFF && s_button_short == src)) {
+        return false;
+    }
+    if (s_button_short != src) {
+        save_button_short(src);
     }
     switch (hdr->cmd_id) {
     case ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID:
@@ -161,9 +189,28 @@ static void start_commissioning_cb(uint8_t mode_mask)
     esp_zb_bdb_start_top_level_commissioning(mode_mask);
 }
 
+static void dump_neighbors(void)
+{
+    esp_zb_nwk_info_iterator_t it = ESP_ZB_NWK_INFO_ITERATOR_INIT;
+    esp_zb_nwk_neighbor_info_t n;
+    int count = 0;
+    ESP_LOGI(TAG, "nwk frame counter %lu", (unsigned long)esp_zb_nwk_get_frame_counter());
+    while (esp_zb_nwk_get_next_neighbor(&it, &n) == ESP_OK) {
+        char s[24];
+        ieee_to_str(n.ieee_addr, s);
+        ESP_LOGI(TAG, "neighbor %s short 0x%04x rel %d type %d rxidle %d lqi %d timeout %lus", s, n.short_addr, n.relationship,
+                 n.device_type, n.rx_on_when_idle, n.lqi, (unsigned long)n.device_timeout);
+        count++;
+    }
+    ESP_LOGI(TAG, "%d neighbors", count);
+}
+
 static void on_network_ready(void)
 {
+    dump_neighbors();
     s_stack_ready = true;
+    ESP_LOGI(TAG, "PAN 0x%04x channel %d short 0x%04x, button %s", esp_zb_get_pan_id(), esp_zb_get_current_channel(),
+             esp_zb_get_short_address(), s_have_button ? "stored" : "none");
     if (!s_have_button) {
         open_pairing_locked();
     } else {
@@ -196,6 +243,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_FORMATION:
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "network formed: PAN 0x%04x channel %d", esp_zb_get_pan_id(), esp_zb_get_current_channel());
+            if (s_have_button) {
+                ESP_LOGW(TAG, "new network formed; stored button belongs to a lost network, clearing");
+                erase_button();
+            }
             on_network_ready();
         } else {
             ESP_LOGW(TAG, "formation failed (%s), retrying", esp_err_to_name(err));
@@ -209,6 +260,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         ESP_LOGI(TAG, "device announce: %s short 0x%04x", s, p->device_short_addr);
         if (s_pairing) {
             save_button(p->ieee_addr);
+            save_button_short(p->device_short_addr);
             s_pairing = false;
             esp_zb_bdb_close_network();
             update_led();
@@ -216,6 +268,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "paired with %s", s);
         }
         if (s_have_button && !memcmp(p->ieee_addr, s_button_ieee, sizeof(s_button_ieee))) {
+            if (s_button_short != p->device_short_addr) {
+                save_button_short(p->device_short_addr);
+            }
             send_bind(p->device_short_addr);
         }
         break;
@@ -231,7 +286,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     }
     default:
-        ESP_LOGD(TAG, "signal %s (0x%x) status %s", esp_zb_zdo_signal_to_string(sig), sig, esp_err_to_name(err));
+        ESP_LOGI(TAG, "signal %s (0x%x) status %s", esp_zb_zdo_signal_to_string(sig), sig, esp_err_to_name(err));
         break;
     }
 }

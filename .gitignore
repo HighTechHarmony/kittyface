@@ -11,3 +11,7 @@ managed_components/
 .cache/
 .DS_Store
 *.swp
+
+# PlatformIO
+.pio/
+sdkconfig.esp32c6
